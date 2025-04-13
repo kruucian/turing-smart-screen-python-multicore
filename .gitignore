@@ -141,3 +141,6 @@ screencap.png
 tmp
 
 external/LibreHardwareMonitor/LibreHardwareMonitorLib.sys
+.config.yaml.swp
+.config.yaml.un~
+config.yaml~
