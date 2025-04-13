@@ -21,9 +21,11 @@
 # For Windows platforms only
 
 import ctypes
+import ctypes.wintypes as wintypes
 import math
 import os
 import sys
+import struct
 from statistics import mean
 from typing import Tuple
 
@@ -256,29 +258,32 @@ class Cpu(sensors.Cpu):
 
 
 class Gpu(sensors.Gpu):
-    # GPU to use is detected once, and its name is saved for future sensors readings
-    gpu_name = ""
-
-    # Latest FPS value is backed up in case next reading returns no value
-    prev_fps = 0
-
-    # Get GPU to use for sensors, and update it
+    # 수정된 get_gpu_to_use 함수: 이름 비교 없이 GPU를 순서대로 반환
     @classmethod
     def get_gpu_to_use(cls):
-        gpu_to_use = get_hw_and_update(Hardware.HardwareType.GpuAmd, cls.gpu_name)
-        if gpu_to_use is None:
-            gpu_to_use = get_hw_and_update(Hardware.HardwareType.GpuNvidia, cls.gpu_name)
-        if gpu_to_use is None:
-            gpu_to_use = get_hw_and_update(Hardware.HardwareType.GpuIntel, cls.gpu_name)
-
-        return gpu_to_use
+        gpu = get_hw_and_update(Hardware.HardwareType.GpuNvidia)
+        if gpu:
+            logger.debug("Using Nvidia GPU: %s", gpu.Name)
+            return gpu
+        gpu = get_hw_and_update(Hardware.HardwareType.GpuAmd)
+        if gpu:
+            logger.debug("Using AMD GPU: %s", gpu.Name)
+            return gpu
+        gpu = get_hw_and_update(Hardware.HardwareType.GpuIntel)
+        if gpu:
+            logger.debug("Using Intel GPU: %s", gpu.Name)
+            return gpu
+        logger.warning("No GPU available for stats")
+        return None
 
     @classmethod
-    def stats(cls) -> Tuple[
-        float, float, float, float, float]:  # load (%) / used mem (%) / used mem (Mb) / total mem (Mb) / temp (°C)
+    def stats(cls) -> Tuple[float, float, float, float, float]:
+        """
+        Returns a tuple:
+          (GPU load [%], GPU memory usage [%], GPU used memory (Mb), GPU total memory (Mb), GPU temperature [°C])
+        """
         gpu_to_use = cls.get_gpu_to_use()
         if gpu_to_use is None:
-            # GPU not supported
             return math.nan, math.nan, math.nan, math.nan, math.nan
 
         load = math.nan
@@ -287,93 +292,90 @@ class Gpu(sensors.Gpu):
         temp = math.nan
 
         for sensor in gpu_to_use.Sensors:
-            if sensor.SensorType == Hardware.SensorType.Load and str(sensor.Name).startswith(
-                    "GPU Core") and sensor.Value is not None:
-                load = float(sensor.Value)
-            elif sensor.SensorType == Hardware.SensorType.Load and str(sensor.Name).startswith("D3D 3D") and math.isnan(
-                    load) and sensor.Value is not None:
-                # Only use D3D usage if global "GPU Core" sensor is not available, because it is less
-                # precise and does not cover the entire GPU: https://www.hwinfo.com/forum/threads/what-is-d3d-usage.759/
-                load = float(sensor.Value)
-            elif sensor.SensorType == Hardware.SensorType.SmallData and str(sensor.Name).startswith(
-                    "GPU Memory Used") and sensor.Value is not None:
-                used_mem = float(sensor.Value)
-            elif sensor.SensorType == Hardware.SensorType.SmallData and str(sensor.Name).startswith(
-                    "D3D") and str(sensor.Name).endswith("Memory Used") and math.isnan(
-                used_mem) and sensor.Value is not None:
-                # Only use D3D memory usage if global "GPU Memory Used" sensor is not available, because it is less
-                # precise and does not cover the entire GPU: https://www.hwinfo.com/forum/threads/what-is-d3d-usage.759/
-                used_mem = float(sensor.Value)
-            elif sensor.SensorType == Hardware.SensorType.SmallData and str(sensor.Name).startswith(
-                    "GPU Memory Total") and sensor.Value is not None:
-                total_mem = float(sensor.Value)
-            elif sensor.SensorType == Hardware.SensorType.Temperature and str(sensor.Name).startswith(
-                    "GPU Core") and sensor.Value is not None:
-                temp = float(sensor.Value)
+            if sensor.SensorType == Hardware.SensorType.Load and sensor.Value is not None:
+                if str(sensor.Name).startswith("GPU Core"):
+                    load = float(sensor.Value)
+                elif str(sensor.Name).startswith("D3D 3D") and math.isnan(load):
+                    load = float(sensor.Value)
+            elif sensor.SensorType == Hardware.SensorType.SmallData and sensor.Value is not None:
+                if str(sensor.Name).startswith("GPU Memory Used"):
+                    used_mem = float(sensor.Value)
+                elif str(sensor.Name).startswith("D3D") and str(sensor.Name).endswith("Memory Used") and math.isnan(used_mem):
+                    used_mem = float(sensor.Value)
+                elif str(sensor.Name).startswith("GPU Memory Total"):
+                    total_mem = float(sensor.Value)
+            elif sensor.SensorType == Hardware.SensorType.Temperature and sensor.Value is not None:
+                if str(sensor.Name).startswith("GPU Core"):
+                    temp = float(sensor.Value)
+        memory_percentage = math.nan
+        if not math.isnan(used_mem) and not math.isnan(total_mem) and total_mem != 0:
+            memory_percentage = used_mem / total_mem * 100.0
+        return load, memory_percentage, used_mem, total_mem, temp
 
-        return load, (used_mem / total_mem * 100.0), used_mem, total_mem, temp
+    @classmethod
+    def utilization_domains(cls) -> dict:
+        domains = {
+            "GPU Core": math.nan,
+            "GPU Memory Controller": math.nan,
+            "GPU Video Engine": math.nan,
+            "GPU Bus": math.nan,
+        }
+        gpu_to_use = cls.get_gpu_to_use()
+        if gpu_to_use is None:
+            return domains
+
+        for sensor in gpu_to_use.Sensors:
+            if sensor.SensorType == Hardware.SensorType.Load and sensor.Value is not None:
+                sensor_name = str(sensor.Name)
+                if sensor_name in domains:
+                    domains[sensor_name] = float(sensor.Value)
+        return domains
 
     @classmethod
     def fps(cls) -> int:
         gpu_to_use = cls.get_gpu_to_use()
         if gpu_to_use is None:
-            # GPU not supported
             return -1
-
         try:
             for sensor in gpu_to_use.Sensors:
-                if sensor.SensorType == Hardware.SensorType.Factor and "FPS" in str(
-                        sensor.Name) and sensor.Value is not None:
-                    # If a reading returns a value <= 0, returns old value instead
+                if sensor.SensorType == Hardware.SensorType.Factor and "FPS" in str(sensor.Name) and sensor.Value is not None:
                     if int(sensor.Value) > 0:
                         cls.prev_fps = int(sensor.Value)
                     return cls.prev_fps
         except:
             pass
-
-        # No FPS sensor for this GPU model
         return -1
 
     @classmethod
     def fan_percent(cls) -> float:
         gpu_to_use = cls.get_gpu_to_use()
         if gpu_to_use is None:
-            # GPU not supported
             return math.nan
-
         try:
             for sensor in gpu_to_use.Sensors:
                 if sensor.SensorType == Hardware.SensorType.Control and sensor.Value is not None:
                     return float(sensor.Value)
         except:
             pass
-
-        # No Fan Speed sensor for this GPU model
         return math.nan
 
     @classmethod
     def frequency(cls) -> float:
         gpu_to_use = cls.get_gpu_to_use()
         if gpu_to_use is None:
-            # GPU not supported
             return math.nan
-
         try:
             for sensor in gpu_to_use.Sensors:
                 if sensor.SensorType == Hardware.SensorType.Clock:
-                    # Keep only real core clocks, ignore effective core clocks
                     if "Core" in str(sensor.Name) and "Effective" not in str(sensor.Name) and sensor.Value is not None:
                         return float(sensor.Value)
         except:
             pass
-
-        # No Frequency sensor for this GPU model
         return math.nan
 
     @classmethod
     def is_available(cls) -> bool:
-        cls.gpu_name = get_gpu_name()
-        return bool(cls.gpu_name)
+        return cls.get_gpu_to_use() is not None
 
 
 class Memory(sensors.Memory):
@@ -443,9 +445,33 @@ class Memory(sensors.Memory):
 
         return 0
 
+# Windows API 상수들
+GENERIC_READ = 0x80000000
+OPEN_EXISTING = 3
 
-# NOTE: all disk data are fetched from psutil Python library, because LHM does not have it.
-# This is because LHM is a hardware-oriented library, whereas used/free/total space is for partitions, not disks
+# IOCTL 명령 (실제 값은 LibreHardwareMonitorLib 구현을 참고)
+IOCTL_SCSI_PASS_THROUGH_DIRECT = 0x4D014  # 예시 값, 필요시 수정
+# 예제에서는 NVMe 건강 정보(온도)를 가져오기 위한 IOCTL 코드 (예시)
+IOCTL_NVM_HEALTH = 0x80CCE314  
+
+# SCSI_PASS_THROUGH_DIRECT 구조체 정의 (간단 버전, 실제 구현은 더 복잡할 수 있음)
+class SCSI_PASS_THROUGH_DIRECT(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("ScsiStatus", wintypes.BYTE),
+        ("PathId", wintypes.BYTE),
+        ("TargetId", wintypes.BYTE),
+        ("Lun", wintypes.BYTE),
+        ("CdbLength", wintypes.BYTE),
+        ("SenseInfoLength", wintypes.BYTE),
+        ("DataIn", wintypes.BYTE),
+        ("DataTransferLength", wintypes.ULONG),
+        ("TimeOutValue", wintypes.ULONG),
+        ("DataBuffer", ctypes.c_void_p),
+        ("SenseInfoOffset", wintypes.ULONG),
+        ("Cdb", ctypes.c_ubyte * 16)
+    ]
+
 class Disk(sensors.Disk):
     @staticmethod
     def disk_usage_percent() -> float:
@@ -459,6 +485,106 @@ class Disk(sensors.Disk):
     def disk_free() -> int:  # In bytes
         return psutil.disk_usage("/").free
 
+    @staticmethod
+    def disk_read_count() -> int:
+        return psutil.disk_io_counters(perdisk=False).read_count
+
+    @staticmethod
+    def disk_write_count() -> int:
+        return psutil.disk_io_counters(perdisk=False).write_count
+
+    @staticmethod
+    def disk_read_bytes() -> int:
+        return psutil.disk_io_counters(perdisk=False).read_bytes
+
+    @staticmethod
+    def disk_write_bytes() -> int:
+        return psutil.disk_io_counters(perdisk=False).write_bytes
+
+    @staticmethod
+    def disk_read_time() -> int:
+        return psutil.disk_io_counters(perdisk=False).read_time
+
+    @staticmethod
+    def disk_write_time() -> int:
+        return psutil.disk_io_counters(perdisk=False).write_time
+
+    @staticmethod
+    def disk_busy_time() -> int:
+        # busy_time은 Windows에서만 지원됩니다.
+        return psutil.disk_io_counters(perdisk=False).busy_time
+
+    @staticmethod
+    def get_health_info(device=r"\\.\PhysicalDrive0"):
+        """
+        NVMe 드라이브에서 온도(temperature) 등 건강 정보를 가져옵니다.
+        Windows 환경에서 DeviceIoControl를 사용합니다.
+        device: 기본값은 PhysicalDrive0, 필요시 다른 드라이브로 변경.
+        """
+        # Windows API 함수 참조
+        CreateFileW = ctypes.windll.kernel32.CreateFileW
+        DeviceIoControl = ctypes.windll.kernel32.DeviceIoControl
+        CloseHandle = ctypes.windll.kernel32.CloseHandle
+
+        # 디바이스 열기
+        handle = CreateFileW(device,
+                            GENERIC_READ,
+                            0,
+                            None,
+                            OPEN_EXISTING,
+                            0,
+                            None)
+        if handle == wintypes.HANDLE(-1).value:
+            return {"temperature": math.nan, "status": f"Failed to open device '{device}'."}
+
+        # SCSI_PASS_THROUGH_DIRECT를 이용한 IOCTL을 위한 버퍼 준비
+        buffer_size = 512
+        data_buffer = (ctypes.c_ubyte * buffer_size)()
+        sptd = SCSI_PASS_THROUGH_DIRECT()
+        sptd.Length = ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT)
+        sptd.ScsiStatus = 0
+        sptd.PathId = 0
+        sptd.TargetId = 0
+        sptd.Lun = 0
+        sptd.CdbLength = 16
+        sptd.SenseInfoLength = 0
+        sptd.DataIn = 1  # Data from device
+        sptd.DataTransferLength = buffer_size
+        sptd.TimeOutValue = 2
+        sptd.DataBuffer = ctypes.cast(data_buffer, ctypes.c_void_p)
+        sptd.SenseInfoOffset = 0
+        # 구성한 SCSI CDB: 아래 CDB는 예시이며 실제 NVMe 건강 정보 명령에 맞게 수정 필요
+        cdb = [0xB5, 0xFE, 0x00, 0x05, 0x00] + [0x00] * 11
+        for i in range(16):
+            sptd.Cdb[i] = cdb[i]
+
+        # IOCTL 호출에 사용할 출력 버퍼 (SCSI_PASS_THROUGH_DIRECT와 data_buffer가 포함된 경우)
+        out_buffer = (ctypes.c_ubyte * (ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT) + buffer_size))()
+        # Copy sptd 구조체 into out_buffer
+        ctypes.memmove(out_buffer, ctypes.byref(sptd), ctypes.sizeof(sptd))
+
+        bytes_returned = wintypes.DWORD(0)
+        ret = DeviceIoControl(handle,
+                            IOCTL_NVM_HEALTH,
+                            out_buffer,
+                            len(out_buffer),
+                            out_buffer,
+                            len(out_buffer),
+                            ctypes.byref(bytes_returned),
+                            None)
+        if not ret:
+            CloseHandle(handle)
+            return {"temperature": math.nan, "status": "DeviceIoControl failed."}
+
+        # 온도 정보 추출: 예시로 out_buffer의 오프셋 위치 6~10을 사용 (빅 엔디안)
+        # (실제 위치 및 처리 방식은 NVMe 드라이브 데이터 구조에 따라 달라짐)
+        raw_temp = struct.unpack('>I', bytes(out_buffer[ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT) + 6:
+                                                        ctypes.sizeof(SCSI_PASS_THROUGH_DIRECT) + 10]))[0]
+        # 온도 처리: 아래 처리는 예시 (해당 온도 값 변환식은 NVMe 스펙에 맞게 수정 필요)
+        temperature = (raw_temp & 0xFFF0) >> 4
+
+        CloseHandle(handle)
+        return {"temperature": temperature, "status": "OK"}
 
 class Net(sensors.Net):
     @staticmethod
@@ -470,7 +596,7 @@ class Net(sensors.Net):
         download_rate = 0
         downloaded = 0
 
-        if if_name != "":
+        if (if_name != ""):
             net_if = get_net_interface_and_update(if_name)
             if net_if is not None:
                 for sensor in net_if.Sensors:

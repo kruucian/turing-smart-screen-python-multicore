@@ -356,6 +356,62 @@ class LcdComm(ABC):
 
         self.DisplayPILImage(bar_image, x, y)
 
+    def DisplayProgressBar_Vert(self, x: int, y: int, width: int, height: int,
+                            min_value: int = 0, max_value: int = 100,
+                            value: int = 50,
+                            bar_color: Color = (0, 0, 0),
+                            bar_outline: bool = True,
+                            background_color: Color = (255, 255, 255),
+                            background_image: Optional[str] = None):
+        # Generate a vertical progress bar and display it
+        # Provide the background image path to display progress bar with transparent background
+
+        bar_color = parse_color(bar_color)
+        background_color = parse_color(background_color)
+
+        assert x <= self.get_width(), 'Progress bar X coordinate must be <= display width'
+        assert y <= self.get_height(), 'Progress bar Y coordinate must be <= display height'
+        assert x + width <= self.get_width(), 'Progress bar width exceeds display width'
+        assert y + height <= self.get_height(), 'Progress bar height exceeds display height'
+
+        if value < min_value:
+            value = min_value
+        elif max_value < value:
+            value = max_value
+
+        assert min_value <= value <= max_value, 'Progress bar value shall be between min and max'
+
+        if background_image is None:
+            # Create a bitmap with a solid background using local coordinates starting at (0,0)
+            bar_image = Image.new('RGB', (width, height), background_color)
+        else:
+            bar_image = self.open_image(background_image)
+            bar_image = bar_image.crop(box=(x, y, x + width, y + height))
+
+        range_value = max_value - min_value
+        if range_value == 0:
+            filled_height = height
+        else:
+            filled_height = (value / range_value) * height
+
+        filled_height = max(0, min(filled_height, height))
+
+        draw = ImageDraw.Draw(bar_image)
+        
+        # Use local coordinates: start drawing from 0, not x/y.
+        fill_y1 = height - int(filled_height)  # 채워지는 영역의 시작 (로컬 좌표)
+        fill_y2 = height                     # 끝
+        
+        draw.rectangle([0, fill_y1, width, fill_y2], 
+                       fill=bar_color, outline=bar_color)
+
+        if bar_outline:
+            draw.rectangle([0, 0, width - 1, height - 1],
+                           fill=None, outline=bar_color)
+
+        # Display the image at (x, y) on the full display
+        self.DisplayPILImage(bar_image, x, y)
+
     def DisplayLineGraph(self, x: int, y: int, width: int, height: int,
                          values: List[float],
                          min_value: float = 0,
@@ -671,7 +727,7 @@ class LcdComm(ABC):
 
     # Load image from the filesystem, or get from the cache if it has already been loaded previously
     def open_image(self, bitmap_path: str) -> Image.Image:
-        if bitmap_path not in self.image_cache:
+        if (bitmap_path) not in self.image_cache:
             logger.debug("Bitmap " + bitmap_path + " is now loaded in the cache")
             self.image_cache[bitmap_path] = Image.open(bitmap_path)
         return copy.copy(self.image_cache[bitmap_path])

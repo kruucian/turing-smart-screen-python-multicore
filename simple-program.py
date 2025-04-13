@@ -36,7 +36,7 @@ from library.log import logger
 # Set your COM port e.g. COM3 for Windows, /dev/ttyACM0 for Linux, etc. or "AUTO" for auto-discovery
 # COM_PORT = "/dev/ttyACM0"
 # COM_PORT = "COM5"
-COM_PORT = "AUTO"
+COM_PORT = "COM3"
 
 # Display revision:
 # - A      for Turing 3.5" and UsbPCMonitor 3.5"/5"
